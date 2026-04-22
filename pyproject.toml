@@ -26,6 +26,10 @@ dependencies = [
     "librosa>=0.10",
     "ssqueezepy>=0.6.5",
 
+    # Note: torch and torchvision must be installed from PyTorch's index with
+    # a matching CUDA build; see README. They are deliberately NOT listed here
+    # because the PyPI wheels lack CUDA and would shadow the correct install.
+
     # Config & logging
     "pyyaml>=6.0",
     "omegaconf>=2.3",
