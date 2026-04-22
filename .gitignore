@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (NEVER commit datasets or large files)
+data/raw/
+data/processed/
+data/cache/
+*.wav
+*.flac
+*.mp3
+*.npz
+*.h5
+*.hdf5
+
+# Experiment outputs
+outputs/
+checkpoints/
+logs/
+wandb/
+lightning_logs/
+runs/
+mlruns/
+
+# Environment / secrets
+.env
+.env.local
+*.key
+
+# Build
+build/
+dist/
+*.egg
