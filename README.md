@@ -12,7 +12,7 @@ Differentiable Gabor-like audio front-end based on complex-valued diagonal state
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/sstfr.git
+git clone https://github.com/zakidemo/sstfr.git
 cd sstfr
 
 # Environment
