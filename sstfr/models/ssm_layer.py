@@ -201,6 +201,17 @@ class SSTFRLayer(nn.Module):
         # Cap at L so we never exceed input length; floor at 64 for sanity.
         K = max(64, min(K, L))
 
+        # Critical for training speed: quantize K to a multiple of 64 so small
+        # drifts in alpha during training do not change the kernel shape.
+        # cuDNN benchmark caches kernel selection by exact tensor shape; a
+        # varying K would force re-tuning on every forward pass (~50x slowdown).
+        # Quantizing to 64 means alpha must drift enough to shift K by a full
+        # 64 samples before cuDNN re-tunes, which essentially never happens
+        # within a single run. The tiny conservatism (at most +63 samples of
+        # kernel past the tolerance threshold) is negligible for accuracy.
+        K = ((K + 63) // 64) * 64
+        K = min(K, L)  # re-clamp after quantization
+
         # --- Build kernel g_d(tau) for tau = 0, ..., K-1 ---
         tau = torch.arange(K, device=device, dtype=alpha.dtype)  # (K,)
         # log_a_tau: (K, D)
