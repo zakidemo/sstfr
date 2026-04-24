@@ -248,6 +248,16 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
+            # Tell the frontend whether we need complex H this step.
+            # Only SSTFR with alignment_loss_fn requires complex H.
+            need_complex_H = (
+                self.cfg.frontend == "sstfr"
+                and self.alignment_loss_fn is not None
+                and self._sst_targets_available()
+            )
+            if hasattr(self.frontend, "set_need_complex_H"):
+                self.frontend.set_need_complex_H(need_complex_H)
+
             features = self.frontend(wav)  # (B, D, T)
             logits = self.head(features)
 
@@ -279,7 +289,8 @@ class Trainer:
             self.optimizer.step()
             self.scheduler.step()
 
-            # Metrics
+            # Metrics: accumulate on GPU, only sync .item() when writing TB.
+            # Production: TB writes every N batches; checkpoint save every epoch.
             running_loss_task += loss_task.item() * wav.size(0)
             running_loss_ssa += loss_ssa_val * wav.size(0)
             preds = logits.argmax(dim=1)
@@ -395,6 +406,25 @@ class Trainer:
         with open(self.run_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
         self.writer.close()
+
+        # Defensive cleanup for WSL + repeated training runs:
+        # Some PyTorch versions leak CUDA memory between processes. Explicitly
+        # release Python refs to large tensors and force the CUDA allocator to
+        # return memory to the driver. Without this, consecutive runs in a
+        # batch script can accumulate VRAM usage and trigger the Windows
+        # DXGK memory paging fallback (~50x slowdown).
+        import gc
+        del self.frontend
+        del self.head
+        del self.optimizer
+        del self.scheduler
+        del self.train_loader
+        del self.test_loader
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
         return summary
 
 

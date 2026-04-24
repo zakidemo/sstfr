@@ -147,8 +147,23 @@ class SSTFRLayer(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_power: bool = False,
+    ) -> torch.Tensor:
         """Run the SSM on a batch of waveforms via truncated FIR convolution.
+
+        Args:
+            x: real tensor of shape (B, L).
+            return_power: If False (default), returns the complex hidden states
+                H of shape (B, L, D). If True, returns |H|^2 directly as a
+                real tensor of shape (B, L, D), avoiding the expensive
+                torch.complex() construction that triggers slow complex-dtype
+                kernels on WSL2. Use True whenever the downstream pipeline
+                only needs |H|^2 (e.g., Log-Mel-like spectrogram extraction)
+                and False when the complex H is needed (e.g., for the
+                Synchrosqueezing Alignment Loss or IF analysis).
 
         Mathematically equivalent to the recurrence h_t = a*h_{t-1} + b*x_t with
         h_0 = 0 (Theorem 1). Unrolled:
@@ -245,8 +260,15 @@ class SSTFRLayer(nn.Module):
         H_real = H_stacked[:, :D, :]  # (B, D, L)
         H_imag = H_stacked[:, D:, :]  # (B, D, L)
 
-        # Combine into complex and reshape to (B, L, D)
-        H = torch.complex(H_real, H_imag).transpose(1, 2).contiguous()  # (B, L, D)
+        if return_power:
+            # Fast path: compute |H|^2 directly in real arithmetic.
+            # |H|^2 = H_real^2 + H_imag^2. Avoids complex dtype entirely,
+            # which sidesteps WSL2's slow complex-conv/complex-abs kernels.
+            power = H_real.pow(2) + H_imag.pow(2)  # (B, D, L)
+            return power.transpose(1, 2).contiguous()  # (B, L, D) real
+
+        # Default path: construct complex H for alignment loss / IF analysis.
+        H = torch.complex(H_real, H_imag).transpose(1, 2).contiguous()  # (B, L, D) complex
         return H
 
 

@@ -42,16 +42,36 @@ def test_logmel_output_shape():
 # SSTFR front-end
 # --------------------------------------------------------------------------
 
-def test_sstfr_frontend_output_shape():
+def test_sstfr_frontend_output_shape_fast_path():
+    """Default path: no complex H, feature map shape is still correct."""
     cfg = SSTFRConfig(num_channels=64, sample_rate=16000)
     fe = SSTFRFrontend(cfg, hop_length=160)
+    fe.train()  # training mode so caching logic runs
     x = torch.randn(2, 16000)
     y = fe(x)
-    print(f"\n  SSTFR frontend output: {tuple(y.shape)}")
+    print(f"\n  SSTFR fast-path output: {tuple(y.shape)}")
     assert y.dim() == 3
     assert y.shape == (2, 64, 100)  # 16000 / 160 = 100
     assert torch.isfinite(y).all()
-    # Last H is cached for alignment loss
+    # Fast path: H is not cached
+    assert fe.last_hidden_states is None, (
+        "Fast path should not cache complex H"
+    )
+
+
+def test_sstfr_frontend_output_shape_complex_path():
+    """Explicit complex path: H is cached as complex tensor."""
+    cfg = SSTFRConfig(num_channels=64, sample_rate=16000)
+    fe = SSTFRFrontend(cfg, hop_length=160)
+    fe.train()
+    fe.set_need_complex_H(True)
+    x = torch.randn(2, 16000)
+    y = fe(x)
+    print(f"\n  SSTFR complex-path output: {tuple(y.shape)}")
+    assert y.shape == (2, 64, 100)
+    assert torch.isfinite(y).all()
+    # Complex path: H is cached with correct shape and dtype
+    assert fe.last_hidden_states is not None
     assert torch.is_complex(fe.last_hidden_states)
     assert fe.last_hidden_states.shape == (2, 16000, 64)
 
