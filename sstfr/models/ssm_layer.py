@@ -183,10 +183,21 @@ class SSTFRLayer(nn.Module):
 
         # --- Adaptive kernel length K ---
         # We want exp(alpha * K) < kernel_tol for ALL channels.
-        # K_d = log(kernel_tol) / alpha_d (alpha is negative). Take the max across channels.
+        # K_d = log(1/kernel_tol) / |alpha_d|. Take the max across channels
+        # (the slowest-decaying channel dictates K).
+        #
+        # Compute K as a Python scalar from detached alpha values to avoid any
+        # device mismatch or gradient-tracking overhead. This is a shape
+        # parameter -- it must not depend on gradients.
         kernel_tol = 1e-5
-        min_abs_alpha = alpha.detach().abs().min().clamp_min(1e-8)  # avoid div-by-zero
-        K = int(torch.ceil(torch.log(torch.tensor(1.0 / kernel_tol)) / min_abs_alpha).item())
+        with torch.no_grad():
+            min_abs_alpha_val = float(alpha.abs().min().cpu().item())
+        # Guard against pathological values (NaN, zero, extremely small alpha
+        # that would demand K > L).
+        if not math.isfinite(min_abs_alpha_val) or min_abs_alpha_val < 1e-8:
+            K = L
+        else:
+            K = int(math.ceil(math.log(1.0 / kernel_tol) / min_abs_alpha_val))
         # Cap at L so we never exceed input length; floor at 64 for sanity.
         K = max(64, min(K, L))
 
