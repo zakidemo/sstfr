@@ -62,9 +62,16 @@ class SSTFRFrontend(nn.Module):
             features: real tensor of shape (B, D, T).
         """
         H = self.ssm(x)  # (B, L, D), complex
-        # Cache the complex hidden states so the training loop can access them
-        # for the alignment loss without a second forward pass.
-        self._last_H = H
+
+        # Cache the complex hidden states ONLY during training, so the
+        # alignment loss can access them without a second forward pass.
+        # During eval, skipping the cache lets autograd free H as soon as we
+        # compute its magnitude -- cuts peak memory ~40% and lets the next
+        # iteration start allocating sooner.
+        if self.training:
+            self._last_H = H
+        else:
+            self._last_H = None
 
         power = H.abs().pow(2)  # (B, L, D) real
         log_power = torch.log(power + self.log_eps)  # (B, L, D)

@@ -210,26 +210,31 @@ class SSTFRLayer(nn.Module):
         b = self.b()  # (D,) complex64
         g = b.unsqueeze(0) * a_tau  # (K, D) complex
 
-        # --- conv1d expects kernel shape (out_channels, in_channels, K) ---
-        # We treat D as out_channels, 1 as in_channels.
-        # For causal conv, we flip the kernel (conv1d correlates, not convolves)
-        # and pad input with K-1 zeros on the left.
-        g_flipped = g.flip(0)  # (K, D)
-        g_weight = g_flipped.transpose(0, 1).unsqueeze(1)  # (D, 1, K)
+        # --- Fused complex conv1d ---
+        # Standard approach: split complex g into real and imaginary parts, do
+        # two conv1d calls, recombine. But each conv1d launches its own cuDNN
+        # workspace. We fuse them: stack real and imag kernels along the
+        # out-channels axis, do ONE conv1d, then split. Halves kernel launches.
+        #
+        # Kernel shape: (out_channels=2D, in_channels=1, K).
+        # First D output channels are real parts, next D are imaginary parts.
+        g_flipped = g.flip(0)  # (K, D) complex
+        g_real = g_flipped.real.transpose(0, 1).unsqueeze(1)  # (D, 1, K)
+        g_imag = g_flipped.imag.transpose(0, 1).unsqueeze(1)  # (D, 1, K)
+        g_weight = torch.cat([g_real, g_imag], dim=0).contiguous()  # (2D, 1, K)
 
-        # conv1d doesn't support complex -- split into real and imaginary kernels
-        g_real = g_weight.real.contiguous()  # (D, 1, K) float32
-        g_imag = g_weight.imag.contiguous()  # (D, 1, K) float32
-
-        # Input: (B, 1, L) float32. Left-pad with K-1 zeros for causal conv.
+        # Input: (B, 1, L) float32, left-padded with K-1 zeros for causal conv.
         x_in = x.unsqueeze(1)  # (B, 1, L)
         x_padded = torch.nn.functional.pad(x_in, (K - 1, 0))  # (B, 1, L + K - 1)
 
-        # Two real convolutions
-        H_real = torch.nn.functional.conv1d(x_padded, g_real)  # (B, D, L)
-        H_imag = torch.nn.functional.conv1d(x_padded, g_imag)  # (B, D, L)
+        # Single conv1d, output shape (B, 2D, L)
+        H_stacked = torch.nn.functional.conv1d(x_padded, g_weight)  # (B, 2D, L)
 
-        # Recombine into complex and reshape to (B, L, D)
+        # Split into real and imaginary halves
+        H_real = H_stacked[:, :D, :]  # (B, D, L)
+        H_imag = H_stacked[:, D:, :]  # (B, D, L)
+
+        # Combine into complex and reshape to (B, L, D)
         H = torch.complex(H_real, H_imag).transpose(1, 2).contiguous()  # (B, L, D)
         return H
 
