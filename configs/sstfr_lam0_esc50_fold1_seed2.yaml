@@ -6,7 +6,7 @@ seed: 2
 data_root: data/raw/ESC-50-master
 sample_rate: 16000
 duration_seconds: 5.0
-num_workers: 4
+num_workers: 0
 num_classes: 50
 num_channels: 128
 f_min: 40.0
