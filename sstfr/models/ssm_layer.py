@@ -152,38 +152,36 @@ class SSTFRLayer(nn.Module):
         x: torch.Tensor,
         return_power: bool = False,
     ) -> torch.Tensor:
-        """Run the SSM on a batch of waveforms via truncated FIR convolution.
+        """Run the SSM on a batch of waveforms via pure real-arithmetic FIR conv.
+
+        This rewrite eliminates all complex-dtype tensors from the hot path.
+        Using the decomposition
+
+            a_d^tau = exp(alpha_d * tau) * [cos(omega_d * tau) + i*sin(omega_d * tau)]
+
+        and b_d = |b_d| * exp(i * phi_d), the impulse response g_d(tau) splits
+        into real and imaginary parts:
+
+            Re(g_d(tau)) = |b_d| * exp(alpha_d * tau) * cos(phi_d + omega_d * tau)
+            Im(g_d(tau)) = |b_d| * exp(alpha_d * tau) * sin(phi_d + omega_d * tau)
+
+        Convolution of the real input x with Re(g) and Im(g) gives the real and
+        imaginary parts of H. This is mathematically identical to the complex
+        formulation (Theorem 1) but never instantiates a complex tensor. Every
+        autograd op is on real tensors, which map to highly optimized CUDA
+        kernels on every platform.
 
         Args:
             x: real tensor of shape (B, L).
-            return_power: If False (default), returns the complex hidden states
-                H of shape (B, L, D). If True, returns |H|^2 directly as a
-                real tensor of shape (B, L, D), avoiding the expensive
-                torch.complex() construction that triggers slow complex-dtype
-                kernels on WSL2. Use True whenever the downstream pipeline
-                only needs |H|^2 (e.g., Log-Mel-like spectrogram extraction)
-                and False when the complex H is needed (e.g., for the
-                Synchrosqueezing Alignment Loss or IF analysis).
+            return_power: If True, return |H|^2 as a real tensor (B, L, D).
+                If False (default), return complex H (B, L, D) by combining
+                the real and imaginary conv outputs at the last moment. Only
+                the return_power=False path pays the complex-dtype cost, and
+                only at the final output -- the training-heavy path uses
+                return_power=True and stays fully real.
 
-        Mathematically equivalent to the recurrence h_t = a*h_{t-1} + b*x_t with
-        h_0 = 0 (Theorem 1). Unrolled:
-
-            h_t = sum_{tau=0}^{t-1} a^tau * b * x_{t-tau}  =  (g * x)[t]
-
-        The kernel g_d(tau) = b_d * a_d^tau decays as exp(alpha_d * tau) with
-        alpha_d < 0. We truncate g to the shortest length K such that
-        exp(min_alpha * K) < `kernel_tol` for every channel. For typical
-        initializations (alpha ~ -0.01) this yields K ~ 1000-2000 samples
-        instead of the full L ~ 80000, cutting memory and compute by 40x+.
-
-        Implementation: a single torch.nn.functional.conv1d call. We express
-        complex convolution as two real convolutions (real and imaginary parts
-        of g), then recombine. This routes through cuDNN, which is faster than
-        FFT for kernels of this length and uses O(B*L*D) memory (no n_fft=2L
-        intermediate).
-
-        Numerically equivalent to the recurrence up to float32 roundoff. The
-        Gabor equivalence tests pass with the same 1e-6 tolerance.
+        Returns:
+            complex (B, L, D) if return_power=False, else real (B, L, D).
         """
         if x.dim() != 2:
             raise ValueError(f"Expected input shape (B, L); got {tuple(x.shape)}.")
@@ -192,84 +190,70 @@ class SSTFRLayer(nn.Module):
         D = self.config.num_channels
         device = x.device
 
-        # --- Compute kernel parameters ---
-        alpha = self.alpha()  # (D,) real, < 0
-        omega = self.omega  # (D,) real
+        # --- Derive real parameters ---
+        alpha = self.alpha()                    # (D,) real, < 0
+        omega = self.omega                      # (D,) real
+        b_mag = torch.exp(self.b_log_mag)       # (D,) real, positive
+        phi = self.b_phase                      # (D,) real
 
-        # --- Adaptive kernel length K ---
-        # We want exp(alpha * K) < kernel_tol for ALL channels.
-        # K_d = log(1/kernel_tol) / |alpha_d|. Take the max across channels
-        # (the slowest-decaying channel dictates K).
-        #
-        # Compute K as a Python scalar from detached alpha values to avoid any
-        # device mismatch or gradient-tracking overhead. This is a shape
-        # parameter -- it must not depend on gradients.
+        # --- Adaptive kernel length K (quantized for cuDNN cache) ---
         kernel_tol = 1e-5
         with torch.no_grad():
             min_abs_alpha_val = float(alpha.abs().min().cpu().item())
-        # Guard against pathological values (NaN, zero, extremely small alpha
-        # that would demand K > L).
         if not math.isfinite(min_abs_alpha_val) or min_abs_alpha_val < 1e-8:
             K = L
         else:
             K = int(math.ceil(math.log(1.0 / kernel_tol) / min_abs_alpha_val))
-        # Cap at L so we never exceed input length; floor at 64 for sanity.
         K = max(64, min(K, L))
+        K = ((K + 63) // 64) * 64  # quantize to multiple of 64
+        K = min(K, L)
 
-        # Critical for training speed: quantize K to a multiple of 64 so small
-        # drifts in alpha during training do not change the kernel shape.
-        # cuDNN benchmark caches kernel selection by exact tensor shape; a
-        # varying K would force re-tuning on every forward pass (~50x slowdown).
-        # Quantizing to 64 means alpha must drift enough to shift K by a full
-        # 64 samples before cuDNN re-tunes, which essentially never happens
-        # within a single run. The tiny conservatism (at most +63 samples of
-        # kernel past the tolerance threshold) is negligible for accuracy.
-        K = ((K + 63) // 64) * 64
-        K = min(K, L)  # re-clamp after quantization
+        # --- Build kernel in pure real arithmetic ---
+        # tau: (K,), phase arg: (K, D), broadcast over channels.
+        tau = torch.arange(K, device=device, dtype=alpha.dtype)
 
-        # --- Build kernel g_d(tau) for tau = 0, ..., K-1 ---
-        tau = torch.arange(K, device=device, dtype=alpha.dtype)  # (K,)
-        # log_a_tau: (K, D)
-        log_a_tau = tau.unsqueeze(1) * torch.complex(alpha, omega).unsqueeze(0)
-        a_tau = torch.exp(log_a_tau)  # (K, D) complex
+        # Envelope: exp(alpha * tau) -- real, shape (K, D)
+        envelope = torch.exp(alpha.unsqueeze(0) * tau.unsqueeze(1))
 
-        b = self.b()  # (D,) complex64
-        g = b.unsqueeze(0) * a_tau  # (K, D) complex
+        # Phase argument: phi + omega * tau -- real, shape (K, D)
+        phase_arg = phi.unsqueeze(0) + omega.unsqueeze(0) * tau.unsqueeze(1)
 
-        # --- Fused complex conv1d ---
-        # Standard approach: split complex g into real and imaginary parts, do
-        # two conv1d calls, recombine. But each conv1d launches its own cuDNN
-        # workspace. We fuse them: stack real and imag kernels along the
-        # out-channels axis, do ONE conv1d, then split. Halves kernel launches.
-        #
-        # Kernel shape: (out_channels=2D, in_channels=1, K).
-        # First D output channels are real parts, next D are imaginary parts.
-        g_flipped = g.flip(0)  # (K, D) complex
-        g_real = g_flipped.real.transpose(0, 1).unsqueeze(1)  # (D, 1, K)
-        g_imag = g_flipped.imag.transpose(0, 1).unsqueeze(1)  # (D, 1, K)
-        g_weight = torch.cat([g_real, g_imag], dim=0).contiguous()  # (2D, 1, K)
+        # Real and imaginary parts of b * a^tau, shape (K, D)
+        scale = b_mag.unsqueeze(0) * envelope      # (K, D) amplitude envelope
+        g_real = scale * torch.cos(phase_arg)      # (K, D)
+        g_imag = scale * torch.sin(phase_arg)      # (K, D)
+
+        # --- Fused real conv1d ---
+        # Flip kernels for causal convolution (conv1d is cross-correlation).
+        g_real_flipped = g_real.flip(0)            # (K, D)
+        g_imag_flipped = g_imag.flip(0)            # (K, D)
+
+        # Stack as (2D, 1, K) for a single conv1d call.
+        weight = torch.stack(
+            [
+                g_real_flipped.transpose(0, 1),    # (D, K)
+                g_imag_flipped.transpose(0, 1),    # (D, K)
+            ],
+            dim=0,
+        )                                          # (2, D, K)
+        weight = weight.reshape(2 * D, 1, K).contiguous()
 
         # Input: (B, 1, L) float32, left-padded with K-1 zeros for causal conv.
-        x_in = x.unsqueeze(1)  # (B, 1, L)
+        x_in = x.unsqueeze(1)                       # (B, 1, L)
         x_padded = torch.nn.functional.pad(x_in, (K - 1, 0))  # (B, 1, L + K - 1)
 
-        # Single conv1d, output shape (B, 2D, L)
-        H_stacked = torch.nn.functional.conv1d(x_padded, g_weight)  # (B, 2D, L)
-
-        # Split into real and imaginary halves
-        H_real = H_stacked[:, :D, :]  # (B, D, L)
-        H_imag = H_stacked[:, D:, :]  # (B, D, L)
+        # Single real conv1d: output (B, 2D, L). First D channels = real, next D = imag.
+        H_stacked = torch.nn.functional.conv1d(x_padded, weight)  # (B, 2D, L)
+        H_real_out = H_stacked[:, :D, :]            # (B, D, L) real
+        H_imag_out = H_stacked[:, D:, :]            # (B, D, L) real
 
         if return_power:
-            # Fast path: compute |H|^2 directly in real arithmetic.
-            # |H|^2 = H_real^2 + H_imag^2. Avoids complex dtype entirely,
-            # which sidesteps WSL2's slow complex-conv/complex-abs kernels.
-            power = H_real.pow(2) + H_imag.pow(2)  # (B, D, L)
-            return power.transpose(1, 2).contiguous()  # (B, L, D) real
+            # |H|^2 = Re(H)^2 + Im(H)^2, entirely real.
+            power = H_real_out.pow(2) + H_imag_out.pow(2)  # (B, D, L) real
+            return power.transpose(1, 2).contiguous()      # (B, L, D) real
 
-        # Default path: construct complex H for alignment loss / IF analysis.
-        H = torch.complex(H_real, H_imag).transpose(1, 2).contiguous()  # (B, L, D) complex
+        # Only build complex tensor if the caller explicitly needs it.
+        H = torch.complex(H_real_out, H_imag_out).transpose(1, 2).contiguous()
         return H
-
 
 __all__ = ["SSTFRConfig", "SSTFRLayer", "mel_spaced_frequencies"]
