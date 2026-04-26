@@ -47,7 +47,6 @@ def ensure_esc50_downloaded(root_dir: str | Path) -> Path:
     dataset_root = root_dir / "ESC-50-master"
 
     if (dataset_root / "meta" / "esc50.csv").exists():
-        # Already present, count files
         audio_dir = dataset_root / "audio"
         n_wavs = len(list(audio_dir.glob("*.wav")))
         if n_wavs >= 2000:
@@ -63,11 +62,10 @@ def ensure_esc50_downloaded(root_dir: str | Path) -> Path:
     response = requests.get(ESC50_URL, stream=True, timeout=60)
     response.raise_for_status()
 
-    # Stream to memory then extract
     buffer = io.BytesIO()
     total = int(response.headers.get("content-length", 0))
     downloaded = 0
-    for chunk in response.iter_content(chunk_size=1 << 20):  # 1 MB chunks
+    for chunk in response.iter_content(chunk_size=1 << 20):
         if chunk:
             buffer.write(chunk)
             downloaded += len(chunk)
@@ -75,7 +73,7 @@ def ensure_esc50_downloaded(root_dir: str | Path) -> Path:
                 pct = 100 * downloaded / total
                 print(f"\r  {downloaded / 1e6:.1f} / {total / 1e6:.1f} MB ({pct:.1f}%)",
                       end="", flush=True)
-    print()  # newline after progress
+    print()
     buffer.seek(0)
 
     print("Extracting...")
@@ -96,17 +94,19 @@ class ESC50Dataset(Dataset):
     """ESC-50 audio classification dataset.
 
     Args:
-        root: Path to the ESC-50-master directory (as returned by
-            ensure_esc50_downloaded).
+        root: Path to the ESC-50-master directory.
         fold: Which fold (1-5) to use as the held-out test fold.
         split: "train" uses the other 4 folds; "test" uses the held-out fold.
         sample_rate: Target sample rate in Hz. Audio is resampled if needed.
             ESC-50 native is 44100 Hz; we downsample to 16000 for SSTFR.
         duration_seconds: Fixed clip duration. ESC-50 clips are 5 seconds;
             shorter clips are zero-padded, longer ones are center-cropped.
-            Default 5.0 (native ESC-50 duration).
-        normalize: If True (default), peak-normalize each waveform to
-            [-1, 1] before returning. Helps with amplitude variation.
+        normalize: If True (default), peak-normalize each waveform to [-1, 1].
+        return_filename: If True, __getitem__ returns (wav, label, filename)
+            instead of (wav, label). Used by the SST precomputation pipeline
+            and the alignment-loss training path so each batch element can be
+            mapped back to its precomputed cache file. Default False for
+            backward compatibility.
     """
 
     NUM_CLASSES = 50
@@ -119,6 +119,7 @@ class ESC50Dataset(Dataset):
         sample_rate: int = 16000,
         duration_seconds: float = 5.0,
         normalize: bool = True,
+        return_filename: bool = False,
     ):
         if fold not in (1, 2, 3, 4, 5):
             raise ValueError(f"fold must be 1-5, got {fold}")
@@ -132,6 +133,7 @@ class ESC50Dataset(Dataset):
         self.sample_rate = sample_rate
         self.duration_samples = int(duration_seconds * sample_rate)
         self.normalize = normalize
+        self.return_filename = return_filename
 
         meta_path = self.root / "meta" / "esc50.csv"
         if not meta_path.exists():
@@ -141,7 +143,6 @@ class ESC50Dataset(Dataset):
             )
         meta = pd.read_csv(meta_path)
 
-        # Filter to the requested split
         if split == "test":
             meta = meta[meta["fold"] == fold]
         else:
@@ -149,7 +150,6 @@ class ESC50Dataset(Dataset):
 
         self.meta = meta.reset_index(drop=True)
 
-        # Cache resamplers per source rate
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
     def __len__(self) -> int:
@@ -165,7 +165,6 @@ class ESC50Dataset(Dataset):
         return self._resamplers[orig_sr](wav)
 
     def _fix_length(self, wav: torch.Tensor) -> torch.Tensor:
-        """Pad with zeros or center-crop to exactly self.duration_samples."""
         L = wav.shape[-1]
         target = self.duration_samples
         if L == target:
@@ -173,16 +172,14 @@ class ESC50Dataset(Dataset):
         if L < target:
             pad = target - L
             return torch.nn.functional.pad(wav, (0, pad))
-        # L > target: center crop
         start = (L - target) // 2
         return wav[..., start : start + target]
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+    def __getitem__(self, idx: int):
         row = self.meta.iloc[idx]
         filepath = self.audio_dir / row["filename"]
 
-        wav, sr = torchaudio.load(str(filepath))  # (C, L)
-        # Force mono: ESC-50 is mono but some files may be encoded as 2-channel identical
+        wav, sr = torchaudio.load(str(filepath))
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
 
@@ -194,8 +191,11 @@ class ESC50Dataset(Dataset):
             if peak > 1e-8:
                 wav = wav / peak
 
-        wav = wav.squeeze(0)  # (L,) -- drop channel dim, SSTFR expects (B, L)
+        wav = wav.squeeze(0)
         label = int(row["target"])
+
+        if self.return_filename:
+            return wav, label, row["filename"]
         return wav, label
 
 
