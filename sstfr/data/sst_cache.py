@@ -215,4 +215,38 @@ class SSTRidgeCache:
         return target, mask
 
 
+    def global_ridge_omegas(self) -> torch.Tensor:
+        """Return a fixed (K,) tensor of mean ridge frequencies (rad/s) across
+        the entire cached dataset, weighted by per-frame mask.
+
+        Computed once at the first call and cached. Use this as the
+        `ridge_omegas` argument to SynchrosqueezingAlignmentLoss so the
+        ridge-to-channel assignment stays stable across training steps
+        (a per-batch ridge_omegas would flicker, causing discontinuous
+        loss values).
+
+        Returns:
+            (K,) float32 tensor on CPU. Caller may .to(device) it once.
+        """
+        if hasattr(self, "_global_omegas_cached"):
+            return self._global_omegas_cached
+
+        # Aggregate weighted sums across all clips
+        K = self.n_ridges
+        sum_weighted = np.zeros(K, dtype=np.float64)
+        sum_weights = np.zeros(K, dtype=np.float64)
+        for omegas, mask in self._entries.values():
+            # omegas, mask: (K, T_hop)
+            sum_weighted += (omegas * mask).sum(axis=1)
+            sum_weights += mask.sum(axis=1)
+
+        # Avoid division by zero on a fully-silent ridge across the dataset
+        # (extremely unlikely but handle it gracefully)
+        denom = np.where(sum_weights > 0, sum_weights, 1.0)
+        global_omegas = (sum_weighted / denom).astype(np.float32)
+
+        self._global_omegas_cached = torch.from_numpy(global_omegas)
+        return self._global_omegas_cached
+
+
 __all__ = ["SSTRidgeCache", "SSTRidgeCacheMissError"]
