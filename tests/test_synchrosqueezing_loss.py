@@ -306,3 +306,132 @@ def test_ridge_indexed_target_form():
     loss = loss_fn(H, target_ridges, channel_omegas, ridge_omegas=ridge_omegas)
     assert torch.isfinite(loss)
     print(f"\n  Ridge-indexed form loss: {loss.item():.3e}")
+
+
+# ----------------------------------------------------------------------
+# Tests for target_mask parameter (added when wiring in SSTRidgeCache)
+# ----------------------------------------------------------------------
+
+
+def _make_complex_H(B: int, L: int, D: int, magnitude: float = 1.0,
+                    seed: int = 0) -> torch.Tensor:
+    """Helper: build a complex tensor with a known magnitude profile."""
+    g = torch.Generator().manual_seed(seed)
+    re = torch.randn(B, L, D, generator=g) * magnitude
+    im = torch.randn(B, L, D, generator=g) * magnitude
+    return torch.complex(re, im)
+
+
+def test_mask_zero_eliminates_loss_contribution():
+    """If target_mask is all zeros, the loss should be eps/eps ~ 0
+    (denominator floored by eps so we don't divide by zero)."""
+    fs = 16000
+    B, L, D = 2, 100, 4
+    loss_fn = SynchrosqueezingAlignmentLoss(sample_rate=fs)
+
+    H = _make_complex_H(B, L, D)
+    target = torch.full((B, L, D), 2 * math.pi * 1000.0)  # 1 kHz target everywhere
+    mask = torch.zeros(B, L, D)
+
+    loss = loss_fn(H, target, channel_omegas=torch.zeros(D), target_mask=mask)
+    # Numerator is 0, denominator is eps -> loss ~ 0
+    assert loss.item() < 1e-3, f"expected near-zero loss, got {loss.item()}"
+
+
+def test_mask_shape_mismatch_raises():
+    fs = 16000
+    B, L, D = 2, 100, 4
+    loss_fn = SynchrosqueezingAlignmentLoss(sample_rate=fs)
+    H = _make_complex_H(B, L, D)
+    target = torch.full((B, L, D), 2 * math.pi * 1000.0)
+    bad_mask = torch.ones(B, L, D + 1)  # wrong D
+    with pytest.raises(ValueError, match="target_mask"):
+        loss_fn(H, target, channel_omegas=torch.zeros(D), target_mask=bad_mask)
+
+
+def test_mask_subset_matches_unmasked_subset():
+    """If we mask half the time axis, the loss equals what we'd get from
+    running the unmasked loss on just the unmasked half."""
+    fs = 16000
+    B, L, D = 2, 100, 4
+    torch.manual_seed(42)
+    loss_fn = SynchrosqueezingAlignmentLoss(sample_rate=fs)
+
+    H = _make_complex_H(B, L, D, seed=42)
+    target_omega = 2 * math.pi * 1000.0
+    target = torch.full((B, L, D), target_omega)
+
+    # Mask: keep first half, drop second half
+    mask = torch.zeros(B, L, D)
+    mask[:, : L // 2, :] = 1.0
+
+    # Method 1: full tensors with mask
+    loss_masked = loss_fn(H, target, channel_omegas=torch.zeros(D),
+                          target_mask=mask)
+
+    # Method 2: pre-trim H and target to the first half, no mask
+    H_first = H[:, : L // 2, :]
+    target_first = target[:, : L // 2, :]
+    loss_unmasked = loss_fn(H_first, target_first, channel_omegas=torch.zeros(D))
+
+    # They should agree to a tight tolerance.
+    # NOTE: the masked version still has a t=0 row in the second half but
+    # both versions have it in the first half -- so they should match.
+    assert torch.isclose(loss_masked, loss_unmasked, rtol=1e-4, atol=1e-4), (
+        f"masked: {loss_masked.item()}, equivalent unmasked: {loss_unmasked.item()}"
+    )
+
+
+def test_mask_works_with_ridge_indexed_target():
+    """target_mask of shape (B, L, K) gets gathered alongside the target
+    by the same ridge-to-channel assignment."""
+    fs = 16000
+    B, L, D, K = 2, 100, 4, 3
+    loss_fn = SynchrosqueezingAlignmentLoss(sample_rate=fs)
+
+    torch.manual_seed(0)
+    H = _make_complex_H(B, L, D)
+
+    # K ridges at distinct frequencies
+    ridge_omegas = torch.tensor([2 * math.pi * f for f in [500.0, 1500.0, 3000.0]])
+    # Channel omegas closer to each of the ridges (deterministic assignment)
+    channel_omegas = torch.tensor([2 * math.pi * f for f in [500.0, 500.0, 1500.0, 3000.0]])
+
+    target = torch.zeros(B, L, K)
+    target[:, :, 0] = 2 * math.pi * 500.0
+    target[:, :, 1] = 2 * math.pi * 1500.0
+    target[:, :, 2] = 2 * math.pi * 3000.0
+
+    # Mask: full mask, ridge 0 active everywhere, ridge 1 inactive, ridge 2 active
+    mask = torch.ones(B, L, K)
+    mask[:, :, 1] = 0.0  # ridge 1 fully masked
+
+    loss = loss_fn(H, target, channel_omegas, ridge_omegas, target_mask=mask)
+    assert torch.isfinite(loss)
+    assert loss.item() >= 0
+
+
+def test_mask_does_not_break_gradients():
+    """Gradients should still flow through SSM channel omegas with a mask."""
+    fs = 16000
+    B, L, D = 2, 100, 4
+    torch.manual_seed(0)
+
+    H = _make_complex_H(B, L, D, seed=0)
+    target = torch.full((B, L, D), 2 * math.pi * 1500.0)
+    mask = torch.zeros(B, L, D)
+    mask[:, : L // 2, :] = 1.0
+
+    channel_omegas = torch.full((D,), 2 * math.pi * 1000.0, requires_grad=True)
+    loss_fn = SynchrosqueezingAlignmentLoss(sample_rate=fs)
+
+    # Note: in the (B, L, D) pre-assigned case, channel_omegas isn't actually
+    # used by the loss (only by the ridge-indexed case). So we test gradients
+    # via H instead.
+    H.requires_grad_(True)
+    loss = loss_fn(H, target, channel_omegas=channel_omegas, target_mask=mask)
+    loss.backward()
+
+    assert H.grad is not None
+    assert torch.isfinite(H.grad).all()
+    assert H.grad.abs().sum() > 0
