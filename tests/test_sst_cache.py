@@ -61,8 +61,8 @@ def test_does_not_contain_unknown_clip(cache: SSTRidgeCache):
 def test_load_batch_shape(cache: SSTRidgeCache):
     filenames = ["1-100038-A-14.wav", "1-100210-A-36.wav"]
     target, mask = cache.load_batch(filenames, device="cpu")
-    assert target.shape == (2, 80000, 3)
-    assert mask.shape == (2, 80000, 3)
+    assert target.shape == (2, 500, 3)
+    assert mask.shape == (2, 500, 3)
     assert target.dtype == torch.float32
     assert mask.dtype == torch.float32
 
@@ -97,7 +97,7 @@ def test_mask_constant_within_hop(cache: SSTRidgeCache):
     """After hop-rate upsampling by repetition, the mask should be constant
     within each hop_length window."""
     filenames = ["1-100038-A-14.wav"]
-    _, mask = cache.load_batch(filenames, device="cpu")
+    _, mask = cache.load_batch(filenames, device="cpu", upsample=True)
     # Reshape to (1, T_hop, hop_length, K) and check each hop window is uniform
     L = mask.shape[1]
     hop = 160
@@ -116,7 +116,7 @@ def test_mask_constant_within_hop(cache: SSTRidgeCache):
 def test_target_constant_within_hop(cache: SSTRidgeCache):
     """Same constancy check for the target."""
     filenames = ["1-100038-A-14.wav"]
-    target, _ = cache.load_batch(filenames, device="cpu")
+    target, _ = cache.load_batch(filenames, device="cpu", upsample=True)
     L = target.shape[1]
     hop = 160
     K = target.shape[2]
@@ -168,6 +168,23 @@ def test_init_rejects_mismatched_hop_length():
             sample_rate=16000,
             hop_length=80,  # wrong!
         )
+
+
+def test_load_batch_upsample_true_returns_sample_rate(cache: SSTRidgeCache):
+    """upsample=True should return (B, L, K) at sample rate, with each hop
+    value repeated hop_length times."""
+    filenames = ["1-100038-A-14.wav"]
+    target_hop, mask_hop = cache.load_batch(filenames, device="cpu", upsample=False)
+    target_full, mask_full = cache.load_batch(filenames, device="cpu", upsample=True)
+    assert target_full.shape == (1, 80000, 3)
+    assert mask_full.shape == (1, 80000, 3)
+    # The first hop_length samples should equal the first hop value, repeated.
+    hop = 160
+    for k in range(3):
+        assert torch.allclose(target_full[0, :hop, k],
+                              target_hop[0, 0, k].expand(hop))
+        assert torch.allclose(mask_full[0, :hop, k],
+                              mask_hop[0, 0, k].expand(hop))
 
 
 def test_init_rejects_missing_cache_dir():

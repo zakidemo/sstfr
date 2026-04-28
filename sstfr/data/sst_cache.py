@@ -148,19 +148,25 @@ class SSTRidgeCache:
         self,
         filenames: Iterable[str],
         device: torch.device | str = "cpu",
+        upsample: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build (B, L, K) target and mask tensors for a batch of clips.
+        """Build target and mask tensors for a batch of clips.
 
         Args:
             filenames: iterable of B clip filenames (e.g., "1-100032-A-0.wav").
                 Either with or without ".wav" extension; both are accepted.
             device: target device for the output tensors.
+            upsample: if True, output is at sample rate (B, L, K) where
+                L = duration * sample_rate. Each hop-rate value is repeated
+                hop_length times. If False (default), output is at hop rate
+                (B, T_hop, K). Hop rate is what the alignment loss should
+                operate on for memory/speed reasons; sample-rate output is
+                kept for backward compatibility and tests.
 
         Returns:
-            target: (B, L, K) float32 -- ridge angular frequencies in rad/s,
-                upsampled from hop rate to sample rate by repetition.
-            mask:   (B, L, K) float32 -- 1 where ridge is meaningful, 0 where
-                masked (silent / noise region), upsampled the same way.
+            target: (B, T, K) float32 ridge angular frequencies in rad/s.
+                T = T_hop if upsample=False, else L.
+            mask:   (B, T, K) float32 binary mask (1=valid frame, 0=masked).
         """
         filenames = list(filenames)
         B = len(filenames)
@@ -170,9 +176,6 @@ class SSTRidgeCache:
         K = self.n_ridges
         T_hop = self.t_hop
 
-        # Allocate batch on CPU (numpy), then upsample, then move to device once.
-        # This is cheaper than allocating L=80000 on GPU per batch and writing
-        # element-wise.
         omegas_hop = np.empty((B, K, T_hop), dtype=np.float32)
         mask_hop = np.empty((B, K, T_hop), dtype=np.float32)
 
@@ -187,26 +190,29 @@ class SSTRidgeCache:
             omegas_hop[i] = entry[0]
             mask_hop[i] = entry[1]
 
-        # Upsample hop rate -> sample rate by repetition.
-        # (B, K, T_hop) -> (B, K, L)
-        omegas_full = np.repeat(omegas_hop, self.hop_length, axis=2)
-        mask_full = np.repeat(mask_hop, self.hop_length, axis=2)
+        if upsample:
+            # Repeat each hop value hop_length times along the time axis.
+            omegas_t = np.repeat(omegas_hop, self.hop_length, axis=2)
+            mask_t = np.repeat(mask_hop, self.hop_length, axis=2)
 
-        # Trim or zero-pad to exactly L (hop_length might not divide L exactly,
-        # though for ESC-50 80000 / 160 = 500 cleanly).
-        L = self.duration_samples
-        if omegas_full.shape[2] != L:
-            if omegas_full.shape[2] > L:
-                omegas_full = omegas_full[:, :, :L]
-                mask_full = mask_full[:, :, :L]
-            else:
-                pad = L - omegas_full.shape[2]
-                omegas_full = np.pad(omegas_full, ((0, 0), (0, 0), (0, pad)))
-                mask_full = np.pad(mask_full, ((0, 0), (0, 0), (0, pad)))
+            # Trim or zero-pad to exactly L (hop_length divides L cleanly for
+            # ESC-50: 80000 / 160 = 500, but be defensive).
+            L = self.duration_samples
+            if omegas_t.shape[2] != L:
+                if omegas_t.shape[2] > L:
+                    omegas_t = omegas_t[:, :, :L]
+                    mask_t = mask_t[:, :, :L]
+                else:
+                    pad = L - omegas_t.shape[2]
+                    omegas_t = np.pad(omegas_t, ((0, 0), (0, 0), (0, pad)))
+                    mask_t = np.pad(mask_t, ((0, 0), (0, 0), (0, pad)))
+        else:
+            omegas_t = omegas_hop
+            mask_t = mask_hop
 
-        # Reshape to (B, L, K) which is what the loss expects.
-        target = torch.from_numpy(omegas_full.transpose(0, 2, 1).copy())
-        mask = torch.from_numpy(mask_full.transpose(0, 2, 1).copy())
+        # Reshape to (B, T, K) which is what the loss expects.
+        target = torch.from_numpy(omegas_t.transpose(0, 2, 1).copy())
+        mask = torch.from_numpy(mask_t.transpose(0, 2, 1).copy())
 
         if str(device) != "cpu":
             target = target.to(device, non_blocking=True)
