@@ -1,0 +1,218 @@
+"""
+In-memory loader for precomputed SST ridge caches.
+
+Loads per-clip .npz files (produced by scripts/precompute_sst.py) into a
+single dict keyed by clip basename, then serves per-batch tensors aligned
+to the trainer's (B, L, K) convention.
+
+Design choices:
+  - Eager loading at init. Total cache for ESC-50 is ~25 MB (uncompressed
+    in memory ~50 MB), trivial.
+  - Targets are stored at hop rate (T_hop = L/hop_length = 500 for ESC-50)
+    and upsampled by repetition at load time to match the alignment loss's
+    sample-rate (L = 80000) convention.
+  - Energy-based masking: frames whose ridge energy is below a per-clip
+    relative threshold are masked out so the loss ignores them. The
+    threshold is `mask_relative_floor * max_energy_for_that_ridge`.
+  - Frequencies are converted from Hz to rad/s (the alignment loss's
+    expected unit) at load time.
+
+Usage:
+    cache = SSTRidgeCache("data/cache/sst_ridges/esc50",
+                          sample_rate=16000, hop_length=160)
+    target, mask = cache.load_batch(filenames, device="cuda")
+    # target: (B, L, K) float32 rad/s
+    # mask:   (B, L, K) float32, 1 where ridge is meaningful, 0 elsewhere
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import torch
+
+
+class SSTRidgeCacheMissError(KeyError):
+    """Raised when a clip's filename is not present in the cache."""
+
+
+class SSTRidgeCache:
+    """Eager in-memory loader for precomputed SST ridge targets.
+
+    Args:
+        cache_dir: path to the dataset cache root
+            (e.g., "data/cache/sst_ridges/esc50"). Expected layout:
+                <cache_dir>/meta.npz
+                <cache_dir>/fold1/<basename>.npz
+                ...
+        sample_rate: audio sample rate in Hz. Must match the precomputation.
+        hop_length: hop in samples used during precomputation.
+        duration_seconds: audio clip length in seconds. Must match.
+        mask_relative_floor: per-ridge energy threshold as a fraction of that
+            ridge's peak energy in the clip. Frames with energy below this
+            threshold are masked. Default 0.05 (5%).
+        absolute_floor: an absolute energy floor in the same units as
+            ridge_energies. Frames below this are also masked, regardless of
+            relative threshold (handles all-silent clips). Default 1e-5.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        sample_rate: int = 16000,
+        hop_length: int = 160,
+        duration_seconds: float = 5.0,
+        mask_relative_floor: float = 0.05,
+        absolute_floor: float = 1e-5,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+        self.duration_samples = int(duration_seconds * sample_rate)
+        self.t_hop = self.duration_samples // hop_length  # 500 for ESC-50
+        self.mask_relative_floor = mask_relative_floor
+        self.absolute_floor = absolute_floor
+
+        # Load meta.npz (shared SST frequency axis + params)
+        meta_path = self.cache_dir / "meta.npz"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"Cache meta not found at {meta_path}. Did you run "
+                f"`python scripts/precompute_sst.py --all-folds`?"
+            )
+        meta = np.load(meta_path, allow_pickle=True)
+        self.ssq_freqs_hz = meta["ssq_freqs_hz"].astype(np.float32)
+        cache_sr = int(meta["sample_rate"])
+        cache_hop = int(meta["hop_length"])
+        if cache_sr != sample_rate or cache_hop != hop_length:
+            raise ValueError(
+                f"Cache was built with sample_rate={cache_sr}, hop={cache_hop}, "
+                f"but loader was constructed with sample_rate={sample_rate}, "
+                f"hop={hop_length}. Recompute the cache or fix the loader args."
+            )
+
+        # Eager-load every clip cache into memory.
+        # Storage: dict[basename] = (ridge_omegas, mask) at hop rate.
+        # We pre-convert Hz -> rad/s and pre-build the mask here so per-batch
+        # cost is just a dict lookup + repeat.
+        self._entries: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+        n_loaded = 0
+        for fold_dir in sorted(self.cache_dir.glob("fold*")):
+            for npz_path in fold_dir.glob("*.npz"):
+                basename = npz_path.stem  # e.g., "1-100032-A-0"
+                d = np.load(npz_path)
+
+                ridge_freqs_hz = d["ridge_freqs_hz"]  # (K, T_hop) float32
+                ridge_energies = d["ridge_energies"]  # (K, T_hop) float32
+
+                if ridge_freqs_hz.shape[1] != self.t_hop:
+                    raise ValueError(
+                        f"{npz_path}: ridge length {ridge_freqs_hz.shape[1]} "
+                        f"!= expected T_hop {self.t_hop}"
+                    )
+
+                # Convert Hz -> rad/s (the loss's unit)
+                ridge_omegas = ridge_freqs_hz * (2.0 * math.pi)  # (K, T_hop)
+
+                # Per-ridge relative + absolute energy mask
+                # Shape (K, T_hop) bool -> float32
+                per_ridge_max = ridge_energies.max(axis=1, keepdims=True)  # (K, 1)
+                rel_threshold = self.mask_relative_floor * per_ridge_max
+                effective_threshold = np.maximum(rel_threshold, self.absolute_floor)
+                mask = (ridge_energies >= effective_threshold).astype(np.float32)
+
+                self._entries[basename] = (ridge_omegas.astype(np.float32), mask)
+                n_loaded += 1
+
+        if n_loaded == 0:
+            raise RuntimeError(
+                f"No cache files found under {self.cache_dir}. "
+                f"Did you run `python scripts/precompute_sst.py --all-folds`?"
+            )
+
+        # Sanity statistic
+        self.n_clips = n_loaded
+        self.n_ridges = next(iter(self._entries.values()))[0].shape[0]
+
+    def __len__(self) -> int:
+        return self.n_clips
+
+    def __contains__(self, basename: str) -> bool:
+        return basename in self._entries
+
+    def load_batch(
+        self,
+        filenames: Iterable[str],
+        device: torch.device | str = "cpu",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build (B, L, K) target and mask tensors for a batch of clips.
+
+        Args:
+            filenames: iterable of B clip filenames (e.g., "1-100032-A-0.wav").
+                Either with or without ".wav" extension; both are accepted.
+            device: target device for the output tensors.
+
+        Returns:
+            target: (B, L, K) float32 -- ridge angular frequencies in rad/s,
+                upsampled from hop rate to sample rate by repetition.
+            mask:   (B, L, K) float32 -- 1 where ridge is meaningful, 0 where
+                masked (silent / noise region), upsampled the same way.
+        """
+        filenames = list(filenames)
+        B = len(filenames)
+        if B == 0:
+            raise ValueError("Empty filename list.")
+
+        K = self.n_ridges
+        T_hop = self.t_hop
+
+        # Allocate batch on CPU (numpy), then upsample, then move to device once.
+        # This is cheaper than allocating L=80000 on GPU per batch and writing
+        # element-wise.
+        omegas_hop = np.empty((B, K, T_hop), dtype=np.float32)
+        mask_hop = np.empty((B, K, T_hop), dtype=np.float32)
+
+        for i, fname in enumerate(filenames):
+            base = fname[:-4] if fname.endswith(".wav") else fname
+            entry = self._entries.get(base)
+            if entry is None:
+                raise SSTRidgeCacheMissError(
+                    f"No cache entry for clip '{fname}'. "
+                    f"Cache size: {self.n_clips}. Run precomputation."
+                )
+            omegas_hop[i] = entry[0]
+            mask_hop[i] = entry[1]
+
+        # Upsample hop rate -> sample rate by repetition.
+        # (B, K, T_hop) -> (B, K, L)
+        omegas_full = np.repeat(omegas_hop, self.hop_length, axis=2)
+        mask_full = np.repeat(mask_hop, self.hop_length, axis=2)
+
+        # Trim or zero-pad to exactly L (hop_length might not divide L exactly,
+        # though for ESC-50 80000 / 160 = 500 cleanly).
+        L = self.duration_samples
+        if omegas_full.shape[2] != L:
+            if omegas_full.shape[2] > L:
+                omegas_full = omegas_full[:, :, :L]
+                mask_full = mask_full[:, :, :L]
+            else:
+                pad = L - omegas_full.shape[2]
+                omegas_full = np.pad(omegas_full, ((0, 0), (0, 0), (0, pad)))
+                mask_full = np.pad(mask_full, ((0, 0), (0, 0), (0, pad)))
+
+        # Reshape to (B, L, K) which is what the loss expects.
+        target = torch.from_numpy(omegas_full.transpose(0, 2, 1).copy())
+        mask = torch.from_numpy(mask_full.transpose(0, 2, 1).copy())
+
+        if str(device) != "cpu":
+            target = target.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+        return target, mask
+
+
+__all__ = ["SSTRidgeCache", "SSTRidgeCacheMissError"]
